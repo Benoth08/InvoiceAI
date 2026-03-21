@@ -4,14 +4,6 @@ Extracteur Intelligent de Factures (OCR + Regles Metier)
 Dataset : SROIE (Scanned Receipts OCR and Information Extraction)
 """
 
-# =============================================================================
-# CELLULE 1 : INSTALLATION DES DEPENDANCES
-# =============================================================================
-# !pip install -q easyocr opencv-python-headless pydantic pillow kagglehub scipy
-
-# =============================================================================
-# CELLULE 2 : IMPORTS
-# =============================================================================
 import os
 import re
 import math
@@ -33,9 +25,6 @@ warnings.filterwarnings("ignore")
 
 print("[OK] Imports termines.")
 
-# =============================================================================
-# CELLULE 3 : TELECHARGEMENT DU DATASET SROIE
-# =============================================================================
 # Le dataset SROIE contient des images de tickets de caisse reels
 # avec les annotations ground truth (texte, entites).
 
@@ -65,11 +54,6 @@ for root, dirs, files in os.walk(dataset_path):
         if len(files) > 5:
             print(f"{sub_indent}... ({len(files)} fichiers)")
 
-# =============================================================================
-# CELLULE 4 : CHARGEMENT DES IMAGES ET ANNOTATIONS
-# =============================================================================
-
-def find_images_and_labels(base_path: str) -> dict:
     """Parcourt le dataset SROIE et associe images et annotations."""
     base = Path(base_path)
     data = {"images": [], "texts": [], "entities": []}
@@ -112,11 +96,6 @@ if n_preview > 0:
     plt.tight_layout()
     plt.show()
 
-# =============================================================================
-# CELLULE 5 : PREPROCESSING DES IMAGES
-# =============================================================================
-
-def preprocess_for_ocr(image: np.ndarray) -> np.ndarray:
     """Pipeline de pretraitement optimise pour l'OCR sur tickets de caisse.
     
     Ordre : niveaux de gris -> deskew -> debruitage -> binarisation adaptative.
@@ -189,9 +168,6 @@ if len(dataset["images"]) > 0:
 
 print("[OK] Module de pretraitement pret.")
 
-# =============================================================================
-# CELLULE 6 : EXTRACTION OCR AVEC EASYOCR
-# =============================================================================
 import easyocr
 
 print("Initialisation d'EasyOCR (premier lancement : telechargement des modeles)...")
@@ -238,11 +214,6 @@ if len(dataset["images"]) > 0:
     print(ocr_result["full_text"][:500])
     print("---")
 
-# =============================================================================
-# CELLULE 7 : MODELES DE DONNEES (PYDANTIC)
-# =============================================================================
-
-class InvoiceLine(BaseModel):
     designation: str = ""
     quantite: float = 1.0
     prix_unitaire: float = 0.0
@@ -271,11 +242,6 @@ class AnomalyReport(BaseModel):
 
 print("[OK] Modeles de donnees definis.")
 
-# =============================================================================
-# CELLULE 8 : EXTRACTION STRUCTUREE (REGEX)
-# =============================================================================
-
-def extract_structured_data(ocr_text: str) -> InvoiceData:
     """Extrait les donnees structurees d'un texte OCR par expressions regulieres.
     
     Cette approche fonctionne sans LLM et couvre les patterns les plus courants
@@ -365,11 +331,6 @@ if len(dataset["images"]) > 0:
     print(f"  TVA          : {test_data.tva_montant}")
     print(f"  Nb lignes    : {len(test_data.lignes)}")
 
-# =============================================================================
-# CELLULE 9 : MOTEUR DE REGLES (DETECTION D'ANOMALIES)
-# =============================================================================
-
-def check_arithmetic(invoice: InvoiceData) -> list:
     """Verifie la coherence arithmetique interne de la facture."""
     issues = []
     tolerance = 0.05
@@ -519,11 +480,6 @@ def analyze_invoice(invoice: InvoiceData, history: list = None) -> AnomalyReport
 
 print("[OK] Moteur de regles pret.")
 
-# =============================================================================
-# CELLULE 10 : PIPELINE COMPLET SUR LE DATASET
-# =============================================================================
-
-def run_full_pipeline(image_path: str) -> tuple:
     """Execute le pipeline complet sur une image : pretraitement -> OCR -> extraction -> regles."""
     img = cv2.imread(image_path)
     if img is None:
@@ -567,11 +523,6 @@ n_warn = sum(1 for r in reports if r.overall_level == "warning")
 n_crit = sum(1 for r in reports if r.overall_level == "critical")
 print(f"  OK: {n_ok}  |  Warnings: {n_warn}  |  Critical: {n_crit}")
 
-# =============================================================================
-# CELLULE 11 : VISUALISATION DES RESULTATS
-# =============================================================================
-
-# --- Distribution des montants extraits ---
 all_ttc = [inv.total_ttc for inv in all_invoices if inv.total_ttc and inv.total_ttc > 0]
 if all_ttc:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -652,11 +603,6 @@ for i, report in enumerate(reports):
 print("\n[OK] Pipeline complet termine.")
 print("Pour l'interface Streamlit, voir la cellule suivante.")
 
-# =============================================================================
-# CELLULE 12 : GENERATION DU FICHIER STREAMLIT (app.py)
-# =============================================================================
-
-streamlit_code = '''
 # -*- coding: utf-8 -*-
 """
 Extracteur de Factures -- Interface Streamlit
