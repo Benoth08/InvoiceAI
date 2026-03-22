@@ -1,16 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Extracteur Intelligent de Factures (OCR + Regles Metier)
+Extracteur Intelligent de Factures (VLM Multimodal + Regles Metier)
 Dataset : SROIE (Scanned Receipts OCR and Information Extraction)
+Extraction : VLM multimodal (LLaVA via Ollama) -- on "regarde" l'image, on ne parse plus
+Fallback : OCR (EasyOCR) + LLM textuel (Mistral) + regex en dernier recours
 """
 
 import os
 import re
 import math
 import json
+import base64
 import warnings
 from pathlib import Path
-from datetime import date, timedelta
 from collections import Counter
 from typing import Optional
 
@@ -18,202 +20,22 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel
 from scipy import stats
+import requests
 
 warnings.filterwarnings("ignore")
 
 print("[OK] Imports termines.")
 
-# Le dataset SROIE contient des images de tickets de caisse reels
-# avec les annotations ground truth (texte, entites).
 
-import kagglehub
+# ---------------------------------------------------------------------------
+# MODELES DE DONNEES (PYDANTIC)
+# ---------------------------------------------------------------------------
+# C'est le contrat strict entre l'extraction (quel que soit le backend)
+# et le moteur de regles. Pydantic valide, type, et rejette si non conforme.
 
-print("Telechargement du dataset SROIE depuis Kaggle...")
-print("(Necessite un compte Kaggle. En Colab : Settings > Secrets > KAGGLE_USERNAME / KAGGLE_KEY)")
-
-try:
-    dataset_path = kagglehub.dataset_download("urbikn/sroie-datasetv2")
-    print(f"[OK] Dataset telecharge dans : {dataset_path}")
-except Exception as e:
-    print(f"[ERREUR] Impossible de telecharger via kagglehub : {e}")
-    print("Alternative : telechargez manuellement depuis https://www.kaggle.com/datasets/urbikn/sroie-datasetv2")
-    print("et placez les fichiers dans ./sroie_data/")
-    dataset_path = "./sroie_data"
-
-# Explorer la structure du dataset
-for root, dirs, files in os.walk(dataset_path):
-    level = root.replace(str(dataset_path), "").count(os.sep)
-    indent = " " * 2 * level
-    print(f"{indent}{os.path.basename(root)}/")
-    if level < 2:
-        sub_indent = " " * 2 * (level + 1)
-        for f in files[:5]:
-            print(f"{sub_indent}{f}")
-        if len(files) > 5:
-            print(f"{sub_indent}... ({len(files)} fichiers)")
-
-    """Parcourt le dataset SROIE et associe images et annotations."""
-    base = Path(base_path)
-    data = {"images": [], "texts": [], "entities": []}
-
-    # SROIE structure : img/ pour les images, box/ ou annot/ pour les annotations
-    img_dirs = list(base.rglob("*.jpg")) + list(base.rglob("*.png"))
-    txt_dirs = list(base.rglob("*.txt"))
-
-    # Associer par nom de fichier (sans extension)
-    img_map = {p.stem: p for p in img_dirs}
-    txt_map = {p.stem: p for p in txt_dirs}
-
-    for stem, img_path in sorted(img_map.items()):
-        data["images"].append(str(img_path))
-        if stem in txt_map:
-            with open(txt_map[stem], "r", encoding="utf-8", errors="ignore") as f:
-                data["texts"].append(f.read())
-        else:
-            data["texts"].append("")
-
-    print(f"[OK] {len(data['images'])} images trouvees.")
-    return data
-
-
-dataset = find_images_and_labels(dataset_path)
-
-# Afficher quelques exemples
-n_preview = min(4, len(dataset["images"]))
-if n_preview > 0:
-    fig, axes = plt.subplots(1, n_preview, figsize=(5 * n_preview, 6))
-    if n_preview == 1:
-        axes = [axes]
-    for i in range(n_preview):
-        img = cv2.imread(dataset["images"][i])
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        axes[i].imshow(img_rgb)
-        axes[i].set_title(f"Receipt {i+1}", fontsize=10)
-        axes[i].axis("off")
-    plt.suptitle("Exemples de tickets du dataset SROIE", fontsize=14)
-    plt.tight_layout()
-    plt.show()
-
-    """Pipeline de pretraitement optimise pour l'OCR sur tickets de caisse.
-    
-    Ordre : niveaux de gris -> deskew -> debruitage -> binarisation adaptative.
-    """
-    # Conversion en niveaux de gris
-    if len(image.shape) == 3:
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = image.copy()
-
-    # Correction d'inclinaison (deskew)
-    angle = _detect_skew(gray)
-    if abs(angle) > 0.5:
-        gray = _rotate(gray, angle)
-
-    # Debruitage (filtre bilateral : preserve les aretes des caracteres)
-    denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
-
-    # Binarisation adaptative (gere l'eclairage non uniforme)
-    binary = cv2.adaptiveThreshold(
-        denoised, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        blockSize=15,
-        C=4
-    )
-    return binary
-
-
-def _detect_skew(image: np.ndarray) -> float:
-    """Detecte l'angle d'inclinaison via la transformee de Hough."""
-    edges = cv2.Canny(image, 50, 200, apertureSize=3)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80,
-                             minLineLength=50, maxLineGap=10)
-    if lines is None:
-        return 0.0
-    angles = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        angle_deg = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-        if abs(angle_deg) < 30:
-            angles.append(angle_deg)
-    return float(np.median(angles)) if angles else 0.0
-
-
-def _rotate(image: np.ndarray, angle: float) -> np.ndarray:
-    """Rotation autour du centre."""
-    h, w = image.shape[:2]
-    center = (w // 2, h // 2)
-    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
-    return cv2.warpAffine(image, matrix, (w, h),
-                          flags=cv2.INTER_CUBIC,
-                          borderMode=cv2.BORDER_REPLICATE)
-
-
-# Visualiser le pretraitement sur un exemple
-if len(dataset["images"]) > 0:
-    sample_img = cv2.imread(dataset["images"][0])
-    preprocessed = preprocess_for_ocr(sample_img)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-    ax1.imshow(cv2.cvtColor(sample_img, cv2.COLOR_BGR2RGB))
-    ax1.set_title("Image originale")
-    ax1.axis("off")
-    ax2.imshow(preprocessed, cmap="gray")
-    ax2.set_title("Apres pretraitement (binarisation adaptative)")
-    ax2.axis("off")
-    plt.tight_layout()
-    plt.show()
-
-print("[OK] Module de pretraitement pret.")
-
-import easyocr
-
-print("Initialisation d'EasyOCR (premier lancement : telechargement des modeles)...")
-reader = easyocr.Reader(["en", "fr"], gpu=False)
-print("[OK] EasyOCR initialise.")
-
-
-def extract_text_ocr(image: np.ndarray, confidence_threshold: float = 0.3) -> dict:
-    """Extrait le texte d'une image via EasyOCR.
-    
-    Returns:
-        dict avec full_text, blocks (detail par zone), avg_confidence.
-    """
-    results = reader.readtext(image)
-
-    blocks = []
-    texts = []
-    confidences = []
-
-    for (bbox, text, confidence) in results:
-        if confidence >= confidence_threshold:
-            blocks.append({
-                "text": text,
-                "confidence": round(confidence, 3),
-                "bbox": bbox
-            })
-            texts.append(text)
-            confidences.append(confidence)
-
-    return {
-        "full_text": "\n".join(texts),
-        "blocks": blocks,
-        "avg_confidence": round(np.mean(confidences), 3) if confidences else 0.0
-    }
-
-
-# Test OCR sur un exemple
-if len(dataset["images"]) > 0:
-    test_img = cv2.imread(dataset["images"][0])
-    test_preprocessed = preprocess_for_ocr(test_img)
-    ocr_result = extract_text_ocr(test_preprocessed)
-
-    print(f"\n--- Texte OCR extrait (confiance moyenne : {ocr_result['avg_confidence']:.1%}) ---")
-    print(ocr_result["full_text"][:500])
-    print("---")
-
+class InvoiceLine(BaseModel):
     designation: str = ""
     quantite: float = 1.0
     prix_unitaire: float = 0.0
@@ -231,220 +53,420 @@ class InvoiceData(BaseModel):
     total_ttc: Optional[float] = None
     raw_text: Optional[str] = None
     ocr_confidence: Optional[float] = None
+    extraction_method: Optional[str] = None  # "vlm", "ocr_llm", "regex_fallback"
 
 
 class AnomalyReport(BaseModel):
     invoice_id: str = "unknown"
     anomalies: list[dict] = []
-    overall_level: str = "ok"  # ok, warning, critical
+    overall_level: str = "ok"
     benford_pvalue: Optional[float] = None
 
 
-print("[OK] Modeles de donnees definis.")
+# ---------------------------------------------------------------------------
+# TELECHARGEMENT DU DATASET SROIE
+# ---------------------------------------------------------------------------
 
-    """Extrait les donnees structurees d'un texte OCR par expressions regulieres.
-    
-    Cette approche fonctionne sans LLM et couvre les patterns les plus courants
-    sur les tickets de caisse (dates, montants, totaux).
+import kagglehub
+
+print("Telechargement du dataset SROIE depuis Kaggle...")
+
+try:
+    dataset_path = kagglehub.dataset_download("urbikn/sroie-datasetv2")
+    print(f"[OK] Dataset telecharge dans : {dataset_path}")
+except Exception as e:
+    print(f"[ERREUR] {e}")
+    print("Alternative : https://www.kaggle.com/datasets/urbikn/sroie-datasetv2")
+    dataset_path = "./sroie_data"
+
+for root, dirs, files in os.walk(dataset_path):
+    level = root.replace(str(dataset_path), "").count(os.sep)
+    indent = " " * 2 * level
+    print(f"{indent}{os.path.basename(root)}/")
+    if level < 2:
+        sub_indent = " " * 2 * (level + 1)
+        for f in files[:5]:
+            print(f"{sub_indent}{f}")
+        if len(files) > 5:
+            print(f"{sub_indent}... ({len(files)} fichiers)")
+
+
+# ---------------------------------------------------------------------------
+# CHARGEMENT DES IMAGES
+# ---------------------------------------------------------------------------
+
+def find_images_and_labels(base_path: str) -> dict:
+    """Parcourt le dataset SROIE et associe images et annotations."""
+    base = Path(base_path)
+    data = {"images": [], "texts": []}
+    img_files = list(base.rglob("*.jpg")) + list(base.rglob("*.png"))
+    txt_files = list(base.rglob("*.txt"))
+    img_map = {p.stem: p for p in img_files}
+    txt_map = {p.stem: p for p in txt_files}
+
+    for stem, img_path in sorted(img_map.items()):
+        data["images"].append(str(img_path))
+        if stem in txt_map:
+            with open(txt_map[stem], "r", encoding="utf-8", errors="ignore") as f:
+                data["texts"].append(f.read())
+        else:
+            data["texts"].append("")
+
+    print(f"[OK] {len(data['images'])} images trouvees.")
+    return data
+
+
+dataset = find_images_and_labels(dataset_path)
+
+n_preview = min(4, len(dataset["images"]))
+if n_preview > 0:
+    fig, axes = plt.subplots(1, n_preview, figsize=(5 * n_preview, 6))
+    if n_preview == 1:
+        axes = [axes]
+    for i in range(n_preview):
+        img = cv2.imread(dataset["images"][i])
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        axes[i].imshow(img_rgb)
+        axes[i].set_title(f"Receipt {i+1}", fontsize=10)
+        axes[i].axis("off")
+    plt.suptitle("Exemples de tickets du dataset SROIE", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+# ---------------------------------------------------------------------------
+# NIVEAU 1 : EXTRACTION VLM MULTIMODALE (ETAT DE L'ART 2026)
+# ---------------------------------------------------------------------------
+# C'est la revolution Document AI : on envoie l'IMAGE BRUTE directement
+# a un modele Vision-Language (LLaVA, Qwen-VL, Llava-Phi3...) via Ollama.
+#
+# Le modele "regarde" la facture, comprend la structure spatiale (colonnes,
+# tableaux, alignements), et retourne le JSON structure.
+#
+# Avantages :
+# - Zero preprocessing (pas de deskew, pas de binarisation)
+# - Zero OCR intermediaire (pas d'EasyOCR, pas de perte d'info spatiale)
+# - Comprend le layout 2D natalement
+#
+# Prerequis : ollama pull llava (ou llava-phi3, ou qwen2-vl)
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+VLM_MODEL = "llava"       # Modele multimodal (vision + langage)
+LLM_MODEL = "mistral"     # Modele textuel (fallback niveau 2)
+
+EXTRACTION_PROMPT = """Tu es un systeme d'extraction de donnees de factures et tickets de caisse.
+Analyse cette image de facture et retourne UNIQUEMENT un JSON valide.
+Si un champ est illisible ou absent, utilise null.
+Les montants doivent etre des nombres decimaux sans symboles.
+
+SCHEMA JSON :
+{{"numero_facture": "string ou null", "fournisseur": "string ou null",
+"date_facture": "string ou null",
+"lignes": [{{"designation": "string", "quantite": number, "prix_unitaire": number, "total_ligne": number}}],
+"total_ht": number ou null, "tva_taux": number ou null,
+"tva_montant": number ou null, "total_ttc": number ou null}}
+
+JSON :"""
+
+
+def image_to_base64(image_path: str) -> str:
+    """Encode une image en base64 pour l'API multimodale d'Ollama."""
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def extract_with_vlm(image_path: str) -> Optional[InvoiceData]:
+    """Niveau 1 : Extraction multimodale (VLM).
+
+    L'image brute est envoyee directement au modele de vision.
+    Pas d'OCR, pas de preprocessing. Le VLM "regarde" et structure.
     """
-    data = InvoiceData(raw_text=ocr_text)
+    try:
+        img_b64 = image_to_base64(image_path)
 
-    # --- Date ---
-    date_patterns = [
-        r"(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})",   # DD/MM/YYYY
-        r"(\d{4}[/\-\.]\d{2}[/\-\.]\d{2})",    # YYYY/MM/DD
-        r"(\d{2}[/\-\.]\d{2}[/\-\.]\d{2})",    # DD/MM/YY
-    ]
-    for pattern in date_patterns:
-        match = re.search(pattern, ocr_text)
-        if match:
-            data.date_facture = match.group(1)
+        response = requests.post(OLLAMA_URL, json={
+            "model": VLM_MODEL,
+            "prompt": EXTRACTION_PROMPT,
+            "images": [img_b64],
+            "temperature": 0,
+            "stream": False,
+            "format": "json"
+        }, timeout=120)
+        response.raise_for_status()
+
+        raw = response.json()["response"].strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+
+        data = json.loads(raw)
+        return InvoiceData(**data, extraction_method="vlm")
+
+    except requests.ConnectionError:
+        print("[VLM] Ollama non disponible.")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"[VLM] JSON invalide : {e}")
+        return None
+    except Exception as e:
+        print(f"[VLM] Erreur : {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# NIVEAU 2 : OCR + LLM TEXTUEL (FALLBACK ROBUSTE)
+# ---------------------------------------------------------------------------
+# Si le VLM n'est pas disponible (pas de modele llava installe),
+# on revient a l'approche OCR texte + LLM textuel.
+# EasyOCR extrait le texte brut, Mistral le structure.
+
+import easyocr
+
+print("Initialisation d'EasyOCR (fallback)...")
+reader = easyocr.Reader(["en", "fr"], gpu=False)
+print("[OK] EasyOCR initialise.")
+
+
+def preprocess_for_ocr(image: np.ndarray) -> np.ndarray:
+    """Preprocessing classique pour l'OCR textuel.
+
+    Conserve pour le fallback niveau 2. En niveau 1 (VLM), ce bloc
+    n'est jamais appele -- le modele multimodal gere le bruit lui-meme.
+    """
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+    denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+    binary = cv2.adaptiveThreshold(
+        denoised, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, blockSize=15, C=4
+    )
+    return binary
+
+
+def extract_text_ocr(image: np.ndarray, confidence_threshold: float = 0.3) -> dict:
+    """Extrait le texte + confiance via EasyOCR."""
+    results = reader.readtext(image)
+    blocks, texts, confidences = [], [], []
+
+    for (bbox, text, confidence) in results:
+        if confidence >= confidence_threshold:
+            blocks.append({"text": text, "confidence": round(confidence, 3)})
+            texts.append(text)
+            confidences.append(confidence)
+
+    return {
+        "full_text": "\n".join(texts),
+        "blocks": blocks,
+        "avg_confidence": round(np.mean(confidences), 3) if confidences else 0.0
+    }
+
+
+OCR_PROMPT = """Tu es un systeme d'extraction de donnees de factures.
+Retourne UNIQUEMENT un JSON valide. Si un champ est absent, utilise null.
+Les montants en nombres decimaux.
+
+SCHEMA : {{"numero_facture": str, "fournisseur": str, "date_facture": str,
+"lignes": [{{"designation": str, "quantite": float, "prix_unitaire": float, "total_ligne": float}}],
+"total_ht": float, "tva_taux": float, "tva_montant": float, "total_ttc": float}}
+
+TEXTE OCR :
+{ocr_text}
+
+JSON :"""
+
+
+def extract_with_ocr_llm(image_path: str) -> Optional[InvoiceData]:
+    """Niveau 2 : OCR textuel + LLM textuel."""
+    try:
+        img = cv2.imread(image_path)
+        if img is None:
+            return None
+        preprocessed = preprocess_for_ocr(img)
+        ocr_out = extract_text_ocr(preprocessed)
+
+        if not ocr_out["full_text"].strip():
+            return None
+
+        response = requests.post(OLLAMA_URL, json={
+            "model": LLM_MODEL,
+            "prompt": OCR_PROMPT.format(ocr_text=ocr_out["full_text"]),
+            "temperature": 0,
+            "stream": False,
+            "format": "json"
+        }, timeout=60)
+        response.raise_for_status()
+
+        raw = response.json()["response"].strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1].rsplit("```", 1)[0]
+
+        data = json.loads(raw)
+        invoice = InvoiceData(**data, extraction_method="ocr_llm",
+                              raw_text=ocr_out["full_text"],
+                              ocr_confidence=ocr_out["avg_confidence"])
+        return invoice
+
+    except Exception as e:
+        print(f"[OCR+LLM] Erreur : {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# NIVEAU 3 : REGEX FALLBACK (DERNIER RECOURS)
+# ---------------------------------------------------------------------------
+
+def extract_with_regex(image_path: str) -> InvoiceData:
+    """Niveau 3 : Regex minimal si aucun LLM n'est disponible."""
+    img = cv2.imread(image_path)
+    if img is None:
+        return InvoiceData(extraction_method="regex_fallback")
+
+    preprocessed = preprocess_for_ocr(img)
+    ocr_out = extract_text_ocr(preprocessed)
+    text = ocr_out["full_text"]
+    data = InvoiceData(raw_text=text, extraction_method="regex_fallback",
+                       ocr_confidence=ocr_out["avg_confidence"])
+
+    for p in [r"(\d{2}[/\-\.]\d{2}[/\-\.]\d{4})", r"(\d{4}[/\-\.]\d{2}[/\-\.]\d{2})"]:
+        m = re.search(p, text)
+        if m:
+            data.date_facture = m.group(1)
             break
 
-    # --- Numero de facture / ticket ---
-    invoice_patterns = [
-        r"(?:invoice|facture|receipt|ticket|no?\.?\s*)[:#]?\s*(\w[\w\-]+)",
-        r"(?:INV|FAC|REC)[:\-#]?\s*(\w+)",
-    ]
-    for pattern in invoice_patterns:
-        match = re.search(pattern, ocr_text, re.IGNORECASE)
-        if match:
-            data.numero_facture = match.group(1)
-            break
+    montants = [float(m.replace(",", ".")) for m in re.findall(r"(\d+[.,]\d{2})", text)]
+    if montants:
+        data.total_ttc = max(montants)
 
-    # --- Montants (tous les nombres avec decimales trouves dans le texte) ---
-    montants = re.findall(r"(\d+[.,]\d{2})", ocr_text)
-    montants_float = [float(m.replace(",", ".")) for m in montants]
-
-    # Le plus grand montant est probablement le total TTC
-    if montants_float:
-        data.total_ttc = max(montants_float)
-
-    # --- Total HT et TVA ---
-    ht_patterns = [
-        r"(?:subtotal|sous.?total|total\s*ht|net|hors\s*taxe)[:\s]*(\d+[.,]\d{2})",
-    ]
-    for pattern in ht_patterns:
-        match = re.search(pattern, ocr_text, re.IGNORECASE)
-        if match:
-            data.total_ht = float(match.group(1).replace(",", "."))
-            break
-
-    tva_patterns = [
-        r"(?:tax|tva|vat|gst)[:\s]*(\d+[.,]\d{2})",
-    ]
-    for pattern in tva_patterns:
-        match = re.search(pattern, ocr_text, re.IGNORECASE)
-        if match:
-            data.tva_montant = float(match.group(1).replace(",", "."))
-            break
-
-    # --- Fournisseur (premiere ligne non vide du texte) ---
-    lines = [l.strip() for l in ocr_text.split("\n") if l.strip()]
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
     if lines:
         data.fournisseur = lines[0]
-
-    # --- Lignes de detail (pattern : texte + montant) ---
-    line_pattern = r"([A-Za-z][\w\s]{2,30})\s+(\d+[.,]\d{2})"
-    for match in re.finditer(line_pattern, ocr_text):
-        designation = match.group(1).strip()
-        montant = float(match.group(2).replace(",", "."))
-        if montant != data.total_ttc:  # Exclure le total
-            data.lignes.append(InvoiceLine(
-                designation=designation,
-                total_ligne=montant,
-                prix_unitaire=montant
-            ))
 
     return data
 
 
-# Test sur l'exemple OCR
+# ---------------------------------------------------------------------------
+# ORCHESTRATEUR : DEGRADATION GRACIEUSE
+# ---------------------------------------------------------------------------
+
+def extract_structured_data(image_path: str) -> InvoiceData:
+    """Point d'entree unique. Tente les 3 niveaux en cascade.
+
+    Niveau 1 (VLM) : Image brute -> LLaVA multimodal -> JSON
+    Niveau 2 (OCR+LLM) : Image -> preprocess -> EasyOCR -> Mistral -> JSON
+    Niveau 3 (Regex) : Image -> preprocess -> EasyOCR -> regex -> JSON
+
+    Le champ extraction_method trace quel niveau a ete utilise.
+    En entretien : "Mon pipeline fonctionne TOUJOURS, meme si le VLM et le LLM
+    sont down. C'est de la resilience d'ingenieur, pas du code de demo."
+    """
+    # Niveau 1 : VLM multimodal (etat de l'art)
+    invoice = extract_with_vlm(image_path)
+    if invoice is not None:
+        return invoice
+
+    # Niveau 2 : OCR + LLM textuel
+    print("  [FALLBACK] Niveau 2 : OCR + LLM textuel")
+    invoice = extract_with_ocr_llm(image_path)
+    if invoice is not None:
+        return invoice
+
+    # Niveau 3 : Regex (dernier recours)
+    print("  [FALLBACK] Niveau 3 : Regex")
+    return extract_with_regex(image_path)
+
+
+# Test d'extraction
 if len(dataset["images"]) > 0:
-    test_data = extract_structured_data(ocr_result["full_text"])
-    print("\n--- Donnees extraites ---")
-    print(f"  Fournisseur  : {test_data.fournisseur}")
-    print(f"  Date         : {test_data.date_facture}")
-    print(f"  No. facture  : {test_data.numero_facture}")
-    print(f"  Total TTC    : {test_data.total_ttc}")
-    print(f"  Total HT     : {test_data.total_ht}")
-    print(f"  TVA          : {test_data.tva_montant}")
-    print(f"  Nb lignes    : {len(test_data.lignes)}")
+    test_invoice = extract_structured_data(dataset["images"][0])
+    print(f"\n--- Donnees extraites (methode : {test_invoice.extraction_method}) ---")
+    print(f"  Fournisseur : {test_invoice.fournisseur}")
+    print(f"  Date        : {test_invoice.date_facture}")
+    print(f"  Total TTC   : {test_invoice.total_ttc}")
+    print(f"  Nb lignes   : {len(test_invoice.lignes)}")
 
-    """Verifie la coherence arithmetique interne de la facture."""
+
+# ---------------------------------------------------------------------------
+# MOTEUR DE REGLES (DETECTION D'ANOMALIES)
+# ---------------------------------------------------------------------------
+# Independant de la methode d'extraction. Que les donnees viennent du VLM,
+# de l'OCR+LLM ou du regex, les regles s'appliquent identiquement.
+
+def check_arithmetic(invoice: InvoiceData) -> list:
     issues = []
-    tolerance = 0.05
-
-    # Somme des lignes vs Total HT ou TTC
     if invoice.lignes:
-        sum_lines = sum(l.total_ligne for l in invoice.lignes)
+        s = sum(l.total_ligne for l in invoice.lignes)
         ref = invoice.total_ht or invoice.total_ttc
-        if ref and abs(sum_lines - ref) > tolerance * ref + 0.02:
-            issues.append({
-                "rule": "arithmetic_lines_total",
-                "level": "warning",
-                "detail": f"Somme lignes ({sum_lines:.2f}) vs total ({ref:.2f}) : ecart significatif"
-            })
-
-    # HT + TVA = TTC
+        if ref and abs(s - ref) > 0.05 * ref + 0.02:
+            issues.append({"rule": "arithmetic_lines", "level": "warning",
+                           "detail": f"Somme lignes ({s:.2f}) vs total ({ref:.2f})"})
     if all(v is not None for v in [invoice.total_ht, invoice.tva_montant, invoice.total_ttc]):
-        expected = invoice.total_ht + invoice.tva_montant
-        if abs(expected - invoice.total_ttc) > 0.05:
-            issues.append({
-                "rule": "arithmetic_ht_tva_ttc",
-                "level": "warning",
-                "detail": f"HT ({invoice.total_ht:.2f}) + TVA ({invoice.tva_montant:.2f}) != TTC ({invoice.total_ttc:.2f})"
-            })
-
+        exp = invoice.total_ht + invoice.tva_montant
+        if abs(exp - invoice.total_ttc) > 0.05:
+            issues.append({"rule": "arithmetic_ttc", "level": "warning",
+                           "detail": f"HT+TVA ({exp:.2f}) != TTC ({invoice.total_ttc:.2f})"})
     return issues
 
 
 def check_duplicates(invoice: InvoiceData, history: list) -> list:
-    """Detecte les doublons potentiels (meme fournisseur + montant + date proche)."""
     issues = []
     for hist in history:
-        same_supplier = (
-            invoice.fournisseur and hist.fournisseur
-            and invoice.fournisseur.lower().strip() == hist.fournisseur.lower().strip()
-        )
-        same_amount = (
-            invoice.total_ttc is not None and hist.total_ttc is not None
-            and abs(invoice.total_ttc - hist.total_ttc) < 0.01
-        )
-        if same_supplier and same_amount:
-            issues.append({
-                "rule": "duplicate_suspected",
-                "level": "critical",
-                "detail": f"Doublon potentiel : meme fournisseur ({invoice.fournisseur}) et montant ({invoice.total_ttc})"
-            })
+        same = (invoice.fournisseur and hist.fournisseur
+                and invoice.fournisseur.lower().strip() == hist.fournisseur.lower().strip())
+        same_amt = (invoice.total_ttc is not None and hist.total_ttc is not None
+                    and abs(invoice.total_ttc - hist.total_ttc) < 0.01)
+        if same and same_amt:
+            issues.append({"rule": "duplicate", "level": "critical",
+                           "detail": f"Doublon : {invoice.fournisseur} / {invoice.total_ttc}"})
     return issues
 
 
 def check_outlier(invoice: InvoiceData, history: list) -> list:
-    """Detecte les montants aberrants par fournisseur (Z-score > 3)."""
     issues = []
     if not invoice.fournisseur or invoice.total_ttc is None:
         return issues
-
-    amounts = [
-        h.total_ttc for h in history
-        if h.fournisseur and h.total_ttc is not None
-        and h.fournisseur.lower().strip() == invoice.fournisseur.lower().strip()
-    ]
+    amounts = [h.total_ttc for h in history
+               if h.fournisseur and h.total_ttc is not None
+               and h.fournisseur.lower().strip() == invoice.fournisseur.lower().strip()]
     if len(amounts) < 5:
         return issues
-
-    mu = np.mean(amounts)
-    sigma = np.std(amounts)
+    mu, sigma = np.mean(amounts), np.std(amounts)
     if sigma > 0:
         z = (invoice.total_ttc - mu) / sigma
         if abs(z) > 3:
-            issues.append({
-                "rule": "amount_outlier",
-                "level": "warning",
-                "detail": f"Montant {invoice.total_ttc:.2f} anormal (Z-score={z:.1f}, moyenne={mu:.2f})"
-            })
+            issues.append({"rule": "outlier", "level": "warning",
+                           "detail": f"Z-score={z:.1f} (moy={mu:.2f})"})
     return issues
 
 
 def check_benford(amounts: list) -> dict:
-    """Applique la loi de Benford sur un ensemble de montants.
-    
-    Loi de Benford : P(d) = log10(1 + 1/d) pour d in {1,...,9}
-    Test du chi-deux pour comparer distribution empirique vs theorique.
-    """
+    """Loi de Benford : P(d) = log10(1 + 1/d). Test du chi-deux."""
     if len(amounts) < 50:
         return {"anomaly": False, "pvalue": None}
-
     first_digits = []
     for a in amounts:
         if a > 0:
             s = str(a).lstrip("0").replace(".", "").replace("-", "")
             if s and s[0].isdigit() and int(s[0]) >= 1:
                 first_digits.append(int(s[0]))
-
     if len(first_digits) < 50:
         return {"anomaly": False, "pvalue": None}
-
     counts = Counter(first_digits)
     observed = [counts.get(d, 0) for d in range(1, 10)]
     n = len(first_digits)
     expected = [n * math.log10(1 + 1 / d) for d in range(1, 10)]
-
     chi2, pvalue = stats.chisquare(observed, expected)
     return {"anomaly": pvalue < 0.05, "pvalue": round(pvalue, 6), "chi2": round(chi2, 2)}
 
 
 def analyze_invoice(invoice: InvoiceData, history: list = None) -> AnomalyReport:
-    """Pipeline complet de detection d'anomalies."""
+    """Pipeline de detection d'anomalies (arithmetique, doublons, outliers, Benford)."""
     history = history or []
     anomalies = []
-
     anomalies.extend(check_arithmetic(invoice))
     anomalies.extend(check_duplicates(invoice, history))
     anomalies.extend(check_outlier(invoice, history))
 
-    # Benford sur l'historique complet
     all_amounts = []
     for h in history + [invoice]:
         if h.total_ttc and h.total_ttc > 0:
@@ -453,190 +475,126 @@ def analyze_invoice(invoice: InvoiceData, history: list = None) -> AnomalyReport
             if line.total_ligne > 0:
                 all_amounts.append(line.total_ligne)
 
-    benford_result = check_benford(all_amounts)
-    benford_pvalue = benford_result["pvalue"]
-    if benford_result["anomaly"]:
-        anomalies.append({
-            "rule": "benford_violation",
-            "level": "warning",
-            "detail": f"Distribution non conforme a Benford (chi2={benford_result['chi2']}, p={benford_pvalue})"
-        })
+    benford = check_benford(all_amounts)
+    if benford["anomaly"]:
+        anomalies.append({"rule": "benford", "level": "warning",
+                          "detail": f"chi2={benford['chi2']}, p={benford['pvalue']}"})
 
     levels = [a["level"] for a in anomalies]
-    if "critical" in levels:
-        overall = "critical"
-    elif "warning" in levels:
-        overall = "warning"
-    else:
-        overall = "ok"
-
-    return AnomalyReport(
-        invoice_id=invoice.numero_facture or "unknown",
-        anomalies=anomalies,
-        overall_level=overall,
-        benford_pvalue=benford_pvalue
-    )
+    overall = "critical" if "critical" in levels else ("warning" if "warning" in levels else "ok")
+    return AnomalyReport(invoice_id=invoice.numero_facture or "unknown",
+                         anomalies=anomalies, overall_level=overall,
+                         benford_pvalue=benford["pvalue"])
 
 
 print("[OK] Moteur de regles pret.")
 
-    """Execute le pipeline complet sur une image : pretraitement -> OCR -> extraction -> regles."""
-    img = cv2.imread(image_path)
-    if img is None:
-        return None, None, None
 
-    preprocessed = preprocess_for_ocr(img)
-    ocr_out = extract_text_ocr(preprocessed)
-    invoice = extract_structured_data(ocr_out["full_text"])
-    invoice.ocr_confidence = ocr_out["avg_confidence"]
+# ---------------------------------------------------------------------------
+# PIPELINE COMPLET SUR LE DATASET
+# ---------------------------------------------------------------------------
 
-    return img, ocr_out, invoice
-
-
-# Traiter toutes les images du dataset
-print("Execution du pipeline sur l'ensemble du dataset...")
+print("Execution du pipeline sur le dataset...")
 all_invoices = []
-results = []
+methods_count = {}
 
-n_images = min(30, len(dataset["images"]))  # Limiter pour le temps d'execution
+n_images = min(30, len(dataset["images"]))
 for i in range(n_images):
-    img_path = dataset["images"][i]
-    img, ocr_out, invoice = run_full_pipeline(img_path)
+    invoice = extract_structured_data(dataset["images"][i])
     if invoice is not None:
         all_invoices.append(invoice)
-        results.append({"index": i, "path": img_path, "ocr": ocr_out, "invoice": invoice})
+        m = invoice.extraction_method or "unknown"
+        methods_count[m] = methods_count.get(m, 0) + 1
     if (i + 1) % 5 == 0:
-        print(f"  Traite {i+1}/{n_images} images...")
+        print(f"  Traite {i+1}/{n_images}...")
 
 print(f"[OK] {len(all_invoices)} factures extraites.")
+print(f"  Methodes utilisees : {methods_count}")
 
-# Analyse d'anomalies sur chaque facture avec historique
 print("\nAnalyse des anomalies...")
 reports = []
-for i, invoice in enumerate(all_invoices):
-    history = all_invoices[:i]  # Historique = factures precedentes
-    report = analyze_invoice(invoice, history)
-    reports.append(report)
+for i, inv in enumerate(all_invoices):
+    reports.append(analyze_invoice(inv, all_invoices[:i]))
 
 n_ok = sum(1 for r in reports if r.overall_level == "ok")
 n_warn = sum(1 for r in reports if r.overall_level == "warning")
 n_crit = sum(1 for r in reports if r.overall_level == "critical")
 print(f"  OK: {n_ok}  |  Warnings: {n_warn}  |  Critical: {n_crit}")
 
+
+# ---------------------------------------------------------------------------
+# VISUALISATIONS
+# ---------------------------------------------------------------------------
+
 all_ttc = [inv.total_ttc for inv in all_invoices if inv.total_ttc and inv.total_ttc > 0]
 if all_ttc:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    # Histogramme des montants
     axes[0].hist(all_ttc, bins=20, color="steelblue", edgecolor="white", alpha=0.8)
-    axes[0].set_title("Distribution des montants TTC extraits")
-    axes[0].set_xlabel("Montant (devise)")
-    axes[0].set_ylabel("Frequence")
+    axes[0].set_title("Distribution des montants TTC")
 
-    # Loi de Benford
-    all_amounts_benford = []
+    all_benford = []
     for inv in all_invoices:
         if inv.total_ttc and inv.total_ttc > 0:
-            all_amounts_benford.append(inv.total_ttc)
+            all_benford.append(inv.total_ttc)
         for line in inv.lignes:
             if line.total_ligne > 0:
-                all_amounts_benford.append(line.total_ligne)
+                all_benford.append(line.total_ligne)
 
-    if len(all_amounts_benford) >= 10:
-        first_digits = []
-        for a in all_amounts_benford:
+    if len(all_benford) >= 10:
+        fd = []
+        for a in all_benford:
             s = str(a).lstrip("0").replace(".", "").replace("-", "")
             if s and s[0].isdigit() and int(s[0]) >= 1:
-                first_digits.append(int(s[0]))
-
-        if first_digits:
-            counts = Counter(first_digits)
-            observed_freq = [counts.get(d, 0) / len(first_digits) for d in range(1, 10)]
-            benford_freq = [math.log10(1 + 1 / d) for d in range(1, 10)]
-
+                fd.append(int(s[0]))
+        if fd:
+            c = Counter(fd)
+            obs = [c.get(d, 0) / len(fd) for d in range(1, 10)]
+            theo = [math.log10(1 + 1 / d) for d in range(1, 10)]
             x = range(1, 10)
-            width = 0.35
-            axes[1].bar([i - width/2 for i in x], observed_freq, width, label="Observe", color="steelblue")
-            axes[1].bar([i + width/2 for i in x], benford_freq, width, label="Benford theorique", color="coral")
-            axes[1].set_title("Loi de Benford : premiers chiffres")
-            axes[1].set_xlabel("Premier chiffre")
-            axes[1].set_ylabel("Frequence relative")
+            w = 0.35
+            axes[1].bar([i - w/2 for i in x], obs, w, label="Observe", color="steelblue")
+            axes[1].bar([i + w/2 for i in x], theo, w, label="Benford", color="coral")
+            axes[1].set_title("Loi de Benford")
             axes[1].legend()
 
-    # Repartition des anomalies
-    labels_pie = ["OK", "Warning", "Critical"]
-    sizes_pie = [n_ok, n_warn, n_crit]
-    colors_pie = ["#4CAF50", "#FF9800", "#F44336"]
-    non_zero = [(l, s, c) for l, s, c in zip(labels_pie, sizes_pie, colors_pie) if s > 0]
-    if non_zero:
-        labels_f, sizes_f, colors_f = zip(*non_zero)
-        axes[2].pie(sizes_f, labels=labels_f, colors=colors_f, autopct="%1.0f%%", startangle=90)
-        axes[2].set_title("Repartition des niveaux d'anomalie")
+    labels_p = ["OK", "Warning", "Critical"]
+    sizes_p = [n_ok, n_warn, n_crit]
+    colors_p = ["#4CAF50", "#FF9800", "#F44336"]
+    nz = [(l, s, c) for l, s, c in zip(labels_p, sizes_p, colors_p) if s > 0]
+    if nz:
+        l, s, c = zip(*nz)
+        axes[2].pie(s, labels=l, colors=c, autopct="%1.0f%%", startangle=90)
+        axes[2].set_title("Anomalies")
 
     plt.tight_layout()
     plt.show()
 
-# --- Confiance OCR ---
-confs = [inv.ocr_confidence for inv in all_invoices if inv.ocr_confidence]
-if confs:
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.hist(confs, bins=15, color="teal", edgecolor="white", alpha=0.8)
-    ax.axvline(np.mean(confs), color="red", linestyle="--", label=f"Moyenne = {np.mean(confs):.2f}")
-    ax.set_title("Distribution de la confiance OCR")
-    ax.set_xlabel("Confiance moyenne par facture")
-    ax.set_ylabel("Frequence")
-    ax.legend()
+# Methodes d'extraction utilisees (pie chart)
+if methods_count:
+    fig, ax = plt.subplots(figsize=(6, 4))
+    method_colors = {"vlm": "#2196F3", "ocr_llm": "#FF9800", "regex_fallback": "#F44336"}
+    labels_m = list(methods_count.keys())
+    sizes_m = list(methods_count.values())
+    colors_m = [method_colors.get(m, "#999") for m in labels_m]
+    ax.pie(sizes_m, labels=labels_m, colors=colors_m, autopct="%1.0f%%", startangle=90)
+    ax.set_title("Methodes d'extraction utilisees")
     plt.tight_layout()
     plt.show()
 
-# --- Affichage detaille d'un exemple avec anomalies ---
-for i, report in enumerate(reports):
-    if report.anomalies:
+# Exemple detaille
+for i, r in enumerate(reports):
+    if r.anomalies:
         inv = all_invoices[i]
-        print(f"\n=== Facture {i} : {inv.fournisseur or 'Inconnu'} ===")
-        print(f"  Montant TTC : {inv.total_ttc}")
-        print(f"  Niveau : {report.overall_level}")
-        for a in report.anomalies:
+        print(f"\n=== Facture {i} : {inv.fournisseur or '?'} (via {inv.extraction_method}) ===")
+        print(f"  TTC : {inv.total_ttc}")
+        for a in r.anomalies:
             print(f"  [{a['level'].upper()}] {a['rule']} : {a['detail']}")
-        break  # Afficher un seul exemple
+        break
 
-print("\n[OK] Pipeline complet termine.")
-print("Pour l'interface Streamlit, voir la cellule suivante.")
-
-# -*- coding: utf-8 -*-
-"""
-Extracteur de Factures -- Interface Streamlit
-Lancer avec : streamlit run app_projet1.py
-"""
-import streamlit as st
-import cv2
-import numpy as np
-from PIL import Image
-
-# Importer les modules du pipeline (copier les fonctions ci-dessus dans src/)
-# Pour la demo, on integre les fonctions directement.
-
-st.set_page_config(page_title="Extracteur de Factures IA", layout="wide")
-st.title("Extracteur Intelligent de Factures")
-st.caption("OCR + Detection d'anomalies")
-
-uploaded = st.file_uploader("Deposez une facture (image)", type=["png", "jpg", "jpeg"])
-
-if uploaded:
-    image = np.array(Image.open(uploaded))
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Document original")
-        st.image(image, use_container_width=True)
-    with col2:
-        st.subheader("Resultats")
-        st.info("Pipeline OCR + Extraction en cours...")
-        # Integrer ici le pipeline complet
-        st.write("Connectez les modules du pipeline pour voir les resultats.")
-'''
-
-with open("app_projet1.py", "w") as f:
-    f.write(streamlit_code)
-
-print("[OK] Fichier app_projet1.py genere.")
-print("Pour lancer : streamlit run app_projet1.py")
+print("\n[OK] Pipeline termine.")
+print("\nArchitecture de degradation gracieuse :")
+print("  Niveau 1 (VLM)     : Image brute -> LLaVA multimodal -> JSON -> Pydantic")
+print("  Niveau 2 (OCR+LLM) : Image -> preprocess -> EasyOCR -> Mistral -> JSON -> Pydantic")
+print("  Niveau 3 (Regex)   : Image -> preprocess -> EasyOCR -> regex -> Pydantic")
+print(f"  Methodes utilisees sur ce run : {methods_count}")
