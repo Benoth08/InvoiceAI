@@ -151,8 +151,39 @@ if n_preview > 0:
 # Prerequis : ollama pull llava (ou llava-phi3, ou qwen2-vl)
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
 VLM_MODEL = "llava"       # Modele multimodal (vision + langage)
 LLM_MODEL = "mistral"     # Modele textuel (fallback niveau 2)
+
+
+def detect_ollama_capabilities() -> dict:
+    """Detecte une seule fois au demarrage quels backends sont disponibles.
+
+    Evite de retenter Ollama a chaque image si le serveur n'est pas lance.
+    Verifie aussi quels modeles sont installes (llava, mistral, etc.).
+    """
+    capabilities = {"ollama_running": False, "vlm_available": False, "llm_available": False}
+
+    try:
+        resp = requests.get(OLLAMA_TAGS_URL, timeout=3)
+        if resp.status_code == 200:
+            capabilities["ollama_running"] = True
+            models = [m.get("name", "").split(":")[0] for m in resp.json().get("models", [])]
+            capabilities["vlm_available"] = VLM_MODEL in models
+            capabilities["llm_available"] = LLM_MODEL in models
+            print(f"[OK] Ollama detecte. Modeles installes : {models}")
+            if not capabilities["vlm_available"]:
+                print(f"  [INFO] VLM '{VLM_MODEL}' non installe (ollama pull {VLM_MODEL})")
+            if not capabilities["llm_available"]:
+                print(f"  [INFO] LLM '{LLM_MODEL}' non installe (ollama pull {LLM_MODEL})")
+    except requests.ConnectionError:
+        print("[INFO] Ollama non detecte. Le pipeline utilisera le fallback regex.")
+        print("       Pour activer les niveaux 1-2 : ollama serve && ollama pull llava")
+
+    return capabilities
+
+
+OLLAMA_CAPS = detect_ollama_capabilities()
 
 EXTRACTION_PROMPT = """Tu es un systeme d'extraction de donnees de factures et tickets de caisse.
 Analyse cette image de facture et retourne UNIQUEMENT un JSON valide.
@@ -218,6 +249,9 @@ def extract_with_vlm(image_path: str) -> Optional[InvoiceData]:
 # Si le VLM n'est pas disponible (pas de modele llava installe),
 # on revient a l'approche OCR texte + LLM textuel.
 # EasyOCR extrait le texte brut, Mistral le structure.
+
+import logging
+logging.getLogger("easyocr").setLevel(logging.ERROR)
 
 import easyocr
 
@@ -350,29 +384,25 @@ def extract_with_regex(image_path: str) -> InvoiceData:
 # ---------------------------------------------------------------------------
 
 def extract_structured_data(image_path: str) -> InvoiceData:
-    """Point d'entree unique. Tente les 3 niveaux en cascade.
+    """Point d'entree unique. Tente les niveaux disponibles en cascade.
 
-    Niveau 1 (VLM) : Image brute -> LLaVA multimodal -> JSON
-    Niveau 2 (OCR+LLM) : Image -> preprocess -> EasyOCR -> Mistral -> JSON
-    Niveau 3 (Regex) : Image -> preprocess -> EasyOCR -> regex -> JSON
-
-    Le champ extraction_method trace quel niveau a ete utilise.
-    En entretien : "Mon pipeline fonctionne TOUJOURS, meme si le VLM et le LLM
-    sont down. C'est de la resilience d'ingenieur, pas du code de demo."
+    La detection des capabilities est faite UNE SEULE FOIS au demarrage
+    (via detect_ollama_capabilities). On ne retente pas Ollama a chaque image
+    si le serveur n'est pas lance.
     """
-    # Niveau 1 : VLM multimodal (etat de l'art)
-    invoice = extract_with_vlm(image_path)
-    if invoice is not None:
-        return invoice
+    # Niveau 1 : VLM multimodal (si disponible)
+    if OLLAMA_CAPS["vlm_available"]:
+        invoice = extract_with_vlm(image_path)
+        if invoice is not None:
+            return invoice
 
-    # Niveau 2 : OCR + LLM textuel
-    print("  [FALLBACK] Niveau 2 : OCR + LLM textuel")
-    invoice = extract_with_ocr_llm(image_path)
-    if invoice is not None:
-        return invoice
+    # Niveau 2 : OCR + LLM textuel (si disponible)
+    if OLLAMA_CAPS["llm_available"]:
+        invoice = extract_with_ocr_llm(image_path)
+        if invoice is not None:
+            return invoice
 
-    # Niveau 3 : Regex (dernier recours)
-    print("  [FALLBACK] Niveau 3 : Regex")
+    # Niveau 3 : Regex (toujours disponible)
     return extract_with_regex(image_path)
 
 
