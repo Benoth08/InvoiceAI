@@ -376,6 +376,19 @@ def extract_with_regex(image_path: str) -> InvoiceData:
     if lines:
         data.fournisseur = lines[0]
 
+    # Extraction des lignes de detail : "designation ... montant"
+    max_val = data.total_ttc or 0
+    for match in re.finditer(r"([A-Za-z][\w\s]{2,30})\s+(\d+[.,]\d{2})", text):
+        designation = match.group(1).strip()
+        montant = float(match.group(2).replace(",", "."))
+        # Exclure le total lui-meme et les montants aberrants
+        if montant != max_val and montant > 0:
+            data.lignes.append(InvoiceLine(
+                designation=designation,
+                total_ligne=montant,
+                prix_unitaire=montant
+            ))
+
     return data
 
 
