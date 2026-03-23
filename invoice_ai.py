@@ -376,13 +376,16 @@ def extract_with_regex(image_path: str) -> InvoiceData:
     if lines:
         data.fournisseur = lines[0]
 
-    # Extraction des lignes de detail : "designation ... montant"
+    # Extraction des lignes de detail
+    # Pattern elargi pour les tickets SROIE (malaysiens, formats varies)
+    # Couvre : "NASI LEMAK 3.50", "Item x2 6.00", "A/B 1.20"
     max_val = data.total_ttc or 0
-    for match in re.finditer(r"([A-Za-z][\w\s]{2,30})\s+(\d+[.,]\d{2})", text):
+    for match in re.finditer(r"(.{2,40}?)\s+(\d+[.,]\d{2})\s*$", text, re.MULTILINE):
         designation = match.group(1).strip()
+        if re.search(r"(?i)(total|subtotal|tax|change|cash|tendered|amount|gst|round)", designation):
+            continue
         montant = float(match.group(2).replace(",", "."))
-        # Exclure le total lui-meme et les montants aberrants
-        if montant != max_val and montant > 0:
+        if 0 < montant < max_val:
             data.lignes.append(InvoiceLine(
                 designation=designation,
                 total_ligne=montant,
