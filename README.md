@@ -51,9 +51,9 @@ Le moteur de regles en aval est totalement agnostique de la methode d'extraction
 
 ## Dataset
 
-**SROIE (Scanned Receipts OCR and Information Extraction)** -- Dataset de reference pour l'OCR sur tickets de caisse reels avec images et annotations ground truth.
+**High-Quality Invoice Images for OCR** -- Dataset de reference pour l'OCR sur factures B2B reelles haute resolution (formats europeens et internationaux).
 
-Source : [Kaggle - SROIE Dataset v2](https://www.kaggle.com/datasets/urbikn/sroie-datasetv2)
+Source : [Kaggle - High-Quality Invoice Images for OCR](https://www.kaggle.com/datasets/osamahosamabdellatif/high-quality-invoice-images-for-ocr)
 
 ## Stack technique
 

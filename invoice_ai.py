@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Extracteur Intelligent de Factures (VLM Multimodal + Regles Metier)
-Dataset : SROIE (Scanned Receipts OCR and Information Extraction)
+Dataset : High-Quality Invoice Images for OCR (Kaggle)
 Extraction : VLM multimodal (LLaVA via Ollama) -- on "regarde" l'image, on ne parse plus
 Fallback : OCR (EasyOCR) + LLM textuel (Mistral) + regex en dernier recours
 """
@@ -23,6 +23,7 @@ from PIL import Image
 from pydantic import BaseModel
 from scipy import stats
 import requests
+from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore")
 
@@ -64,72 +65,62 @@ class AnomalyReport(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# TELECHARGEMENT DU DATASET SROIE
+# TELECHARGEMENT DU DATASET (Factures B2B haute qualite)
 # ---------------------------------------------------------------------------
 
 import kagglehub
 
-print("Telechargement du dataset SROIE depuis Kaggle...")
+print("Telechargement du dataset 'High-Quality Invoice Images for OCR'...")
 
 try:
-    dataset_path = kagglehub.dataset_download("urbikn/sroie-datasetv2")
+    dataset_path = kagglehub.dataset_download(
+        "osamahosamabdellatif/high-quality-invoice-images-for-ocr"
+    )
     print(f"[OK] Dataset telecharge dans : {dataset_path}")
 except Exception as e:
     print(f"[ERREUR] {e}")
-    print("Alternative : https://www.kaggle.com/datasets/urbikn/sroie-datasetv2")
-    dataset_path = "./sroie_data"
+    print("Alternative : https://www.kaggle.com/datasets/osamahosamabdellatif/high-quality-invoice-images-for-ocr")
+    dataset_path = "./invoice_data"
 
 for root, dirs, files in os.walk(dataset_path):
     level = root.replace(str(dataset_path), "").count(os.sep)
-    indent = " " * 2 * level
-    print(f"{indent}{os.path.basename(root)}/")
     if level < 2:
-        sub_indent = " " * 2 * (level + 1)
-        for f in files[:5]:
-            print(f"{sub_indent}{f}")
-        if len(files) > 5:
-            print(f"{sub_indent}... ({len(files)} fichiers)")
+        indent = " " * 2 * level
+        n_files = len(files)
+        print(f"{indent}{os.path.basename(root)}/  ({n_files} fichiers)" if n_files else f"{indent}{os.path.basename(root)}/")
 
 
 # ---------------------------------------------------------------------------
 # CHARGEMENT DES IMAGES
 # ---------------------------------------------------------------------------
 
-def find_images_and_labels(base_path: str) -> dict:
-    """Parcourt le dataset SROIE et associe images et annotations."""
+def find_invoice_images(base_path: str) -> list:
+    """Collecte toutes les images de factures du dataset."""
     base = Path(base_path)
-    data = {"images": [], "texts": []}
-    img_files = list(base.rglob("*.jpg")) + list(base.rglob("*.png"))
-    txt_files = list(base.rglob("*.txt"))
-    img_map = {p.stem: p for p in img_files}
-    txt_map = {p.stem: p for p in txt_files}
-
-    for stem, img_path in sorted(img_map.items()):
-        data["images"].append(str(img_path))
-        if stem in txt_map:
-            with open(txt_map[stem], "r", encoding="utf-8", errors="ignore") as f:
-                data["texts"].append(f.read())
-        else:
-            data["texts"].append("")
-
-    print(f"[OK] {len(data['images'])} images trouvees.")
-    return data
+    extensions = ["*.jpg", "*.jpeg", "*.png", "*.tif", "*.tiff", "*.bmp"]
+    images = []
+    for ext in extensions:
+        images.extend([str(p) for p in base.rglob(ext)])
+    images = sorted(images)
+    print(f"[OK] {len(images)} images de factures trouvees.")
+    return images
 
 
-dataset = find_images_and_labels(dataset_path)
+dataset_images = find_invoice_images(dataset_path)
 
-n_preview = min(4, len(dataset["images"]))
+n_preview = min(4, len(dataset_images))
 if n_preview > 0:
     fig, axes = plt.subplots(1, n_preview, figsize=(5 * n_preview, 6))
     if n_preview == 1:
         axes = [axes]
     for i in range(n_preview):
-        img = cv2.imread(dataset["images"][i])
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        axes[i].imshow(img_rgb)
-        axes[i].set_title(f"Receipt {i+1}", fontsize=10)
+        img = cv2.imread(dataset_images[i])
+        if img is not None:
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            axes[i].imshow(img_rgb)
+        axes[i].set_title(Path(dataset_images[i]).name, fontsize=8)
         axes[i].axis("off")
-    plt.suptitle("Exemples de tickets du dataset SROIE", fontsize=14)
+    plt.suptitle("Exemples de factures du dataset", fontsize=14)
     plt.tight_layout()
     plt.show()
 
@@ -185,7 +176,7 @@ def detect_ollama_capabilities() -> dict:
 
 OLLAMA_CAPS = detect_ollama_capabilities()
 
-EXTRACTION_PROMPT = """Tu es un systeme d'extraction de donnees de factures et tickets de caisse.
+EXTRACTION_PROMPT = """Tu es un systeme d'extraction de donnees de factures.
 Analyse cette image de facture et retourne UNIQUEMENT un JSON valide.
 Si un champ est illisible ou absent, utilise null.
 Les montants doivent etre des nombres decimaux sans symboles.
@@ -377,7 +368,7 @@ def extract_with_regex(image_path: str) -> InvoiceData:
         data.fournisseur = lines[0]
 
     # Extraction des lignes de detail
-    # Pattern elargi pour les tickets SROIE (malaysiens, formats varies)
+    # Pattern elargi pour les factures (formats varies, internationaux)
     # Couvre : "NASI LEMAK 3.50", "Item x2 6.00", "A/B 1.20"
     max_val = data.total_ttc or 0
     for match in re.finditer(r"(.{2,40}?)\s+(\d+[.,]\d{2})\s*$", text, re.MULTILINE):
@@ -423,8 +414,8 @@ def extract_structured_data(image_path: str) -> InvoiceData:
 
 
 # Test d'extraction
-if len(dataset["images"]) > 0:
-    test_invoice = extract_structured_data(dataset["images"][0])
+if len(dataset_images) > 0:
+    test_invoice = extract_structured_data(dataset_images[0])
     print(f"\n--- Donnees extraites (methode : {test_invoice.extraction_method}) ---")
     print(f"  Fournisseur : {test_invoice.fournisseur}")
     print(f"  Date        : {test_invoice.date_facture}")
@@ -544,22 +535,19 @@ print("Execution du pipeline sur le dataset...")
 all_invoices = []
 methods_count = {}
 
-n_images = min(30, len(dataset["images"]))
-for i in range(n_images):
-    invoice = extract_structured_data(dataset["images"][i])
+n_images = min(50, len(dataset_images))
+for i in tqdm(range(n_images), desc="Extraction des factures", unit="facture"):
+    invoice = extract_structured_data(dataset_images[i])
     if invoice is not None:
         all_invoices.append(invoice)
         m = invoice.extraction_method or "unknown"
         methods_count[m] = methods_count.get(m, 0) + 1
-    if (i + 1) % 5 == 0:
-        print(f"  Traite {i+1}/{n_images}...")
 
 print(f"[OK] {len(all_invoices)} factures extraites.")
 print(f"  Methodes utilisees : {methods_count}")
 
-print("\nAnalyse des anomalies...")
 reports = []
-for i, inv in enumerate(all_invoices):
+for i, inv in enumerate(tqdm(all_invoices, desc="Analyse des anomalies", unit="facture")):
     reports.append(analyze_invoice(inv, all_invoices[:i]))
 
 n_ok = sum(1 for r in reports if r.overall_level == "ok")
