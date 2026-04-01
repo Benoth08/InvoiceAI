@@ -1,143 +1,84 @@
 # InvoiceAI -- Extracteur Intelligent de Factures
 
-> Pipeline VLM multimodal + detection d'anomalies statistiques pour l'automatisation du traitement de factures
-
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![VLM](https://img.shields.io/badge/Extraction-LLaVA%20Multimodal-purple)
-![Ollama](https://img.shields.io/badge/Inference-Ollama%20Local-green)
-![Streamlit](https://img.shields.io/badge/Interface-Streamlit-red)
-![Status](https://img.shields.io/badge/Status-Portfolio%20PoC-orange)
+Pipeline d'extraction automatique de donnees de factures avec detection de fraudes et d'anomalies.
 
 ---
 
-## Le probleme metier
+## A quoi ca sert
 
-Le traitement manuel de factures coute en moyenne 10 a 15 minutes par document avec un taux d'erreur humain de 3 a 5%. Les fraudes (doublons, surfacturation, fournisseurs fantomes) representent 1 a 5% du chiffre d'affaires en industrie.
+On donne une image de facture au systeme. Il extrait automatiquement les informations cles (fournisseur, date, montants, lignes de detail) et verifie si quelque chose est suspect (erreur de calcul, doublon, montant anormal, manipulation statistique).
 
-## La solution
+## Comment ca marche
 
-Un pipeline end-to-end qui extrait automatiquement les donnees structurees d'une facture et applique une batterie de controles statistiques pour detecter les anomalies et fraudes potentielles.
+Le pipeline fonctionne en deux etapes independantes :
 
-## Ce qui distingue ce projet
+**Etape 1 -- Extraction des donnees**
 
-L'approche est en 3 niveaux de degradation gracieuse. Le pipeline fonctionne TOUJOURS, meme si le modele le plus avance est indisponible.
+Le systeme lit la facture et en extrait un JSON structure. Trois methodes sont disponibles, de la plus performante a la plus basique :
 
-```
-Niveau 1 (VLM)      : Image brute -> LLaVA multimodal -> JSON -> Pydantic
-Niveau 2 (OCR+LLM)  : Image -> Preprocess -> EasyOCR -> Mistral -> JSON -> Pydantic
-Niveau 3 (Regex)    : Image -> Preprocess -> EasyOCR -> Regex -> Pydantic
-                                    |
-                                    v
-                     Moteur de regles (agnostique de la source)
-                     Benford | Z-score | Doublons | Arithmetique
-```
+- **VLM multimodal (LLaVA)** : un modele de vision analyse directement l'image. Il comprend le layout (colonnes, tableaux) sans avoir besoin d'OCR. C'est la methode la plus fiable.
+- **OCR + LLM textuel (Mistral)** : EasyOCR extrait le texte, puis un LLM le structure en JSON. Moins precis car on perd l'information spatiale.
+- **OCR + Regex** : parsing basique du texte OCR. Fragile mais fonctionne sans aucun modele IA.
 
-**Niveau 1 (etat de l'art 2026)** : L'image brute est envoyee directement a un modele Vision-Language (LLaVA via Ollama). Le VLM "regarde" la facture, comprend la structure spatiale (colonnes, tableaux, alignements) et retourne le JSON. Zero preprocessing. Zero OCR. Zero regex.
+Le systeme essaie automatiquement la meilleure methode disponible. Si le VLM n'est pas installe, il passe au LLM textuel. Si aucun LLM n'est disponible, il utilise le regex. Le pipeline ne plante jamais.
 
-**Niveau 2 (fallback robuste)** : Si le VLM n'est pas installe, EasyOCR extrait le texte et Mistral (LLM textuel) le structure en JSON.
+**Etape 2 -- Detection d'anomalies**
 
-**Niveau 3 (dernier recours)** : Si aucun LLM n'est disponible, un parsing regex minimal assure que le pipeline ne plante pas.
+Quelle que soit la methode d'extraction, les memes controles s'appliquent :
 
-Le moteur de regles en aval est totalement agnostique de la methode d'extraction : les memes controles statistiques s'appliquent quel que soit le niveau utilise.
-
-## Resultats
-
-| Metrique | Valeur |
-|---|---|
-| Extraction VLM (LLaVA) | Comprehension du layout 2D natif |
-| Regles d'anomalies | 4 (arithmetique, doublons, outliers Z-score, Benford) |
-| Traitement par facture | < 10s (VLM local), < 5s (OCR+LLM) |
-| Confidentialite | 100% local (Ollama), zero donnee envoyee |
+- **Coherence arithmetique** : est-ce que HT + TVA = TTC ? Est-ce que la somme des lignes correspond au total ?
+- **Doublons** : meme fournisseur + meme montant = alerte.
+- **Montants aberrants** : si un fournisseur facture habituellement 500 euros et qu'une facture arrive a 5 000 euros, le Z-score le detecte.
+- **Loi de Benford** : test statistique (chi-deux) sur la distribution des premiers chiffres des montants. Un ecart a la loi theorique signale une possible manipulation comptable. Necessite 50+ montants pour etre fiable.
 
 ## Dataset
 
-**High-Quality Invoice Images for OCR** -- Dataset de reference pour l'OCR sur factures B2B reelles haute resolution (formats europeens et internationaux).
+**High-Quality Invoice Images for OCR** -- Factures B2B reelles (formats europeens et internationaux), avec colonnes, tableaux, TVA et lignes de detail.
 
-Source : [Kaggle - High-Quality Invoice Images for OCR](https://www.kaggle.com/datasets/osamahosamabdellatif/high-quality-invoice-images-for-ocr)
+[Kaggle - High-Quality Invoice Images](https://www.kaggle.com/datasets/osamahosamabdellatif/high-quality-invoice-images-for-ocr)
 
-## Stack technique
+## Technologies utilisees
 
-| Composant | Technologie | Justification |
+| Quoi | Avec quoi | Pourquoi |
 |---|---|---|
-| Extraction niveau 1 | LLaVA (Ollama) | VLM multimodal, comprend le layout 2D sans OCR |
-| Extraction niveau 2 | EasyOCR + Mistral (Ollama) | Fallback textuel si pas de VLM |
-| Extraction niveau 3 | EasyOCR + Regex | Dernier recours, zero dependance LLM |
-| Preprocessing (niv 2-3) | OpenCV | Deskew, debruitage, binarisation adaptative |
-| Validation donnees | Pydantic v2 | Contrat strict entre extraction et regles |
-| Detection d'anomalies | Python + SciPy | Benford (chi2), Z-score, doublons, arithmetique |
-| Inference locale | Ollama | Gratuit, offline, RGPD |
-| Interface | Streamlit | Upload + resultats + anomalies |
+| Extraction (methode principale) | LLaVA via Ollama | Comprend l'image directement, pas besoin d'OCR |
+| Extraction (fallback) | EasyOCR + Mistral | Si le VLM n'est pas installe |
+| Validation des donnees | Pydantic v2 | Schema strict, rejet automatique si le JSON est invalide |
+| Detection d'anomalies | SciPy + NumPy | Benford (chi-deux), Z-score, comparaison arithmetique |
+| Inference locale | Ollama | Gratuit, offline, les donnees restent sur la machine |
+| Interface | Streamlit | Upload de facture + resultats + anomalies |
 
-## Structure du projet
+## Fichiers
 
 ```
 InvoiceAI/
 ├── README.md
 ├── requirements.txt
-├── invoice_ai.py           # Pipeline complet (3 niveaux + regles + visualisations)
+├── invoice_ai.py           # Pipeline complet
 └── cours_projet1.md        # Cours pedagogique detaille
 ```
 
-## Installation et execution
+## Lancer le projet
 
 ```bash
-# Cloner
-git clone https://github.com/<votre-username>/InvoiceAI.git
-cd InvoiceAI
-
-# Dependances Python
 pip install -r requirements.txt
 
-# Installer Ollama (https://ollama.ai)
-# Puis telecharger les modeles :
-ollama pull llava       # Niveau 1 : VLM multimodal
-ollama pull mistral     # Niveau 2 : LLM textuel
+# Pour la methode VLM (recommande) :
+# Installer Ollama (https://ollama.ai) puis :
+ollama pull llava
 
-# Lancer le pipeline
+# Pour la methode OCR + LLM :
+ollama pull mistral
+
+# Lancer
 python invoice_ai.py
-
-# Ou l'interface Streamlit
-streamlit run app.py
 ```
 
-Le pipeline fonctionne meme sans Ollama (niveau 3 regex), mais les niveaux 1 et 2 necessitent qu'Ollama soit lance (`ollama serve`).
+Le projet tourne aussi sans Ollama (methode regex), mais les resultats sont moins bons.
 
-## Regles de detection implementees
+## Ce que ca montre en entretien
 
-### 1. Coherence arithmetique
-Verifie que la somme des lignes correspond au total HT et que HT + TVA == TTC.
-
-### 2. Detection de doublons
-Compare chaque facture a l'historique : meme fournisseur + meme montant.
-
-### 3. Valeurs aberrantes (Z-score)
-Pour un fournisseur donne, alerte si le montant depasse 3 ecarts-types de la moyenne historique.
-
-### 4. Loi de Benford
-Analyse la distribution des premiers chiffres significatifs des montants via un test du chi-deux. Un ecart significatif (p < 0.05) signale une potentielle manipulation. Necessite 50+ montants.
-
-## Pourquoi VLM plutot que OCR + Regex ?
-
-| Approche | Avantage | Inconvenient |
-|---|---|---|
-| Regex | Zero dependance | Casse a chaque nouveau format |
-| OCR + LLM textuel | Comprend la semantique | Perd le layout 2D (colonnes, tableaux) |
-| VLM multimodal | Comprend layout + semantique | Modele plus lourd (~4 Go RAM) |
-
-L'approche VLM est l'etat de l'art en Document AI en 2026. Le modele voit l'image comme un humain : il comprend que "50.00" est aligne sous la colonne "TVA" sans avoir besoin de regex pour le deviner.
-
-## Extensions possibles
-
-- **Qwen2-VL ou LLaVA-NeXT** pour une meilleure precision multimodale
-- **Base SQLite** pour l'historique des factures
-- **API REST (FastAPI)** pour l'integration SI
-- **LayoutLMv3** comme alternative locale sans Ollama
-- **Export PDF** du rapport d'anomalies
-
-## Auteur
-
-Projet realise dans le cadre d'un portfolio Data Science / IA industrielle.
-
----
-
-*Ce projet demontre la maitrise de l'architecture de degradation gracieuse (VLM -> OCR+LLM -> Regex), la separation extraction / validation, et l'application de statistiques avancees (Benford, Z-score) a la detection de fraude.*
+- Savoir chainer extraction IA + validation metier dans un pipeline robuste
+- Appliquer des statistiques avancees (Benford, Z-score) a un probleme concret de fraude
+- Coder pour la production (Pydantic, gestion d'erreurs, tracabilite de la methode utilisee)
+- Garder les donnees en local (Ollama) pour la confidentialite
