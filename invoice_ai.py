@@ -491,18 +491,6 @@ def extract_structured_data(image_path: str) -> InvoiceData:
     return extract_with_regex(image_path)
 
 
-# Test d'extraction sur une image
-if len(dataset_images) > 0:
-    test_invoice = extract_structured_data(dataset_images[0])
-    print(f"\n--- Donnees extraites (methode : {test_invoice.extraction_method}) ---")
-    print(f"  Fournisseur : {test_invoice.fournisseur}")
-    print(f"  Date        : {test_invoice.date_facture}")
-    print(f"  Total TTC   : {test_invoice.total_ttc}")
-    print(f"  Nb lignes   : {len(test_invoice.lignes)}")
-    if test_invoice.pydantic_ttc_valid is not None:
-        print(f"  TTC valide  : {test_invoice.pydantic_ttc_valid}")
-
-
 # ---------------------------------------------------------------------------
 # STOCKAGE VECTORIEL (CHROMADB) -- Remplace la liste Python
 # ---------------------------------------------------------------------------
