@@ -1,52 +1,55 @@
 # InvoiceAI -- Extracteur Intelligent de Factures
 
-Pipeline d'extraction automatique de donnees de factures avec detection de fraudes et d'anomalies.
+Pipeline d'extraction automatique de factures avec detection de fraudes en 4 niveaux.
 
 ---
 
 ## A quoi ca sert
 
-On donne une image de facture au systeme. Il extrait automatiquement les informations cles (fournisseur, date, montants, lignes de detail) et verifie si quelque chose est suspect (erreur de calcul, doublon, montant anormal, manipulation statistique).
+On donne une image de facture. Le systeme extrait les donnees (fournisseur, date, montants, lignes de detail), les stocke dans une base vectorielle, et les passe dans 4 niveaux de controle pour detecter les anomalies et fraudes potentielles.
 
 ## Comment ca marche
 
-Le pipeline fonctionne en deux etapes independantes :
+### Extraction
 
-**Etape 1 -- Extraction des donnees**
+Trois methodes, de la plus performante a la plus basique. Le systeme essaie la meilleure disponible et descend automatiquement si besoin :
 
-Le systeme lit la facture et en extrait un JSON structure. Trois methodes sont disponibles, de la plus performante a la plus basique :
+- **VLM multimodal (LLaVA)** : le modele de vision regarde directement l'image, comprend le layout, retourne le JSON. Si le JSON est invalide, il retente une fois en injectant l'erreur dans le prompt.
+- **OCR + LLM (Mistral)** : EasyOCR extrait le texte, Mistral le structure. Meme logique de retry.
+- **OCR + Regex** : parsing basique. Fragile mais fonctionne sans modele IA.
 
-- **VLM multimodal (LLaVA)** : un modele de vision analyse directement l'image. Il comprend le layout (colonnes, tableaux) sans avoir besoin d'OCR. C'est la methode la plus fiable.
-- **OCR + LLM textuel (Mistral)** : EasyOCR extrait le texte, puis un LLM le structure en JSON. Moins precis car on perd l'information spatiale.
-- **OCR + Regex** : parsing basique du texte OCR. Fragile mais fonctionne sans aucun modele IA.
+### Detection d'anomalies (4 niveaux)
 
-Le systeme essaie automatiquement la meilleure methode disponible. Si le VLM n'est pas installe, il passe au LLM textuel. Si aucun LLM n'est disponible, il utilise le regex. Le pipeline ne plante jamais.
+**Niveau 1 -- Regles deterministes** : coherence arithmetique (HT+TVA=TTC, somme des lignes = total), doublons exacts (hash SHA256), doublons semantiques (cosine similarity via ChromaDB, seuil > 0.95).
 
-**Etape 2 -- Detection d'anomalies**
+**Niveau 2 -- Rapprochement ERP** : verification que la facture correspond a un bon de commande reel. Hors scope PoC mais prevu dans l'architecture.
 
-Quelle que soit la methode d'extraction, les memes controles s'appliquent :
+**Niveau 3 -- Scoring ML** : Isolation Forest en multivarie (montant + nb lignes + ratio TTC/HT + ecart lignes), Z-score monovarie par fournisseur, loi de Benford sur la distribution des premiers chiffres (test du chi-deux).
 
-- **Coherence arithmetique** : est-ce que HT + TVA = TTC ? Est-ce que la somme des lignes correspond au total ?
-- **Doublons** : meme fournisseur + meme montant = alerte.
-- **Montants aberrants** : si un fournisseur facture habituellement 500 euros et qu'une facture arrive a 5 000 euros, le Z-score le detecte.
-- **Loi de Benford** : test statistique (chi-deux) sur la distribution des premiers chiffres des montants. Un ecart a la loi theorique signale une possible manipulation comptable. Necessite 50+ montants pour etre fiable.
+**Niveau 4 -- LLM reasoning** : quand les niveaux precedents declenchent des alertes, un LLM analyse l'ensemble des indices en Chain-of-Thought et produit une recommandation (APPROVE / REVIEW / BLOCK).
+
+### Stockage
+
+ChromaDB (base vectorielle locale) stocke chaque facture avec ses metadonnees. La recherche de doublons semantiques se fait par requete vectorielle filtree par fournisseur.
 
 ## Dataset
 
-**High-Quality Invoice Images for OCR** -- Factures B2B reelles (formats europeens et internationaux), avec colonnes, tableaux, TVA et lignes de detail.
+**High-Quality Invoice Images for OCR** -- Factures B2B reelles.
 
-[Kaggle - High-Quality Invoice Images](https://www.kaggle.com/datasets/osamahosamabdellatif/high-quality-invoice-images-for-ocr)
+[Kaggle](https://www.kaggle.com/datasets/osamahosamabdellatif/high-quality-invoice-images-for-ocr)
 
-## Technologies utilisees
+## Technologies
 
-| Quoi | Avec quoi | Pourquoi |
-|---|---|---|
-| Extraction (methode principale) | LLaVA via Ollama | Comprend l'image directement, pas besoin d'OCR |
-| Extraction (fallback) | EasyOCR + Mistral | Si le VLM n'est pas installe |
-| Validation des donnees | Pydantic v2 | Schema strict, rejet automatique si le JSON est invalide |
-| Detection d'anomalies | SciPy + NumPy | Benford (chi-deux), Z-score, comparaison arithmetique |
-| Inference locale | Ollama | Gratuit, offline, les donnees restent sur la machine |
-| Interface | Streamlit | Upload de facture + resultats + anomalies |
+| Quoi | Avec quoi |
+|---|---|
+| Extraction VLM | LLaVA via Ollama |
+| Extraction fallback | EasyOCR + Mistral |
+| Preprocessing | OpenCV + Sauvola (scikit-image) |
+| Validation | Pydantic v2 (avec field_validator croise) |
+| Stockage vectoriel | ChromaDB |
+| Anomalies ML | Isolation Forest (scikit-learn) |
+| Anomalies stats | Z-score, Benford (SciPy) |
+| LLM reasoning | Mistral via Ollama |
 
 ## Fichiers
 
@@ -55,30 +58,75 @@ InvoiceAI/
 ├── README.md
 ├── requirements.txt
 ├── invoice_ai.py           # Pipeline complet
-└── cours_projet1.md        # Cours pedagogique detaille
+└── cours_projet1.md        # Cours pedagogique
 ```
 
-## Lancer le projet
+## Lancer en local
 
 ```bash
 pip install -r requirements.txt
 
-# Pour la methode VLM (recommande) :
-# Installer Ollama (https://ollama.ai) puis :
-ollama pull llava
+# Recommande : installer Ollama + modeles
+# https://ollama.com/download
+ollama serve &
+ollama pull llava       # VLM multimodal
+ollama pull mistral     # LLM textuel + raisonnement fraude
 
-# Pour la methode OCR + LLM :
-ollama pull mistral
-
-# Lancer
 python invoice_ai.py
 ```
 
-Le projet tourne aussi sans Ollama (methode regex), mais les resultats sont moins bons.
+Fonctionne aussi sans Ollama (mode regex + regles deterministes uniquement), mais les performances sont limitees.
 
-## Ce que ca montre en entretien
+## Lancer sur Google Colab
 
-- Savoir chainer extraction IA + validation metier dans un pipeline robuste
-- Appliquer des statistiques avancees (Benford, Z-score) a un probleme concret de fraude
-- Coder pour la production (Pydantic, gestion d'erreurs, tracabilite de la methode utilisee)
-- Garder les donnees en local (Ollama) pour la confidentialite
+Sur Colab, Ollama necessite d'etre installe manuellement. Active le GPU (Runtime > Change runtime type > T4 GPU) pour des performances acceptables.
+
+### Cellule 1 : Installation d'Ollama
+
+```bash
+# Installer zstd (prerequis manquant sur Colab)
+!apt-get install -y zstd
+
+# Installer Ollama
+!curl -fsSL https://ollama.com/install.sh | sh
+
+# Lancer le serveur en background
+!nohup ollama serve > ollama.log 2>&1 &
+!sleep 5
+
+# Verifier que le serveur repond
+!curl http://localhost:11434/api/tags
+
+# Telecharger les modeles (5-10 min chacun)
+!ollama pull mistral
+!ollama pull llava
+
+# Verifier
+!ollama list
+```
+
+### Cellule 2 : Dependances Python
+
+```bash
+!pip install -r requirements.txt
+```
+
+### Cellule 3 : Lancer le pipeline
+
+```python
+!python invoice_ai.py
+```
+
+Au demarrage, le script detecte Ollama et affiche :
+```
+[OK] Ollama detecte. Modeles : ['mistral', 'llava']
+```
+
+### Limitations Colab
+
+- Session qui expire apres 90 min d'inactivite (modeles a re-telecharger)
+- GPU T4 limite a ~3-4h par jour en version gratuite
+- Sans GPU : LLaVA met 30-60 secondes par image
+
+**Alternative recommandee** : installer Ollama en local sur ta machine pour un workflow persistant. Les modeles restent telecharges entre sessions.
+
