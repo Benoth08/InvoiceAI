@@ -229,21 +229,32 @@ print("[OK] Preprocessing pret.")
 
 
 # ---------------------------------------------------------------------------
-# OCR (EASYOCR) -- Conserve pour le fallback et le monitoring
+# OCR (EASYOCR) -- Lazy loading : charge uniquement si fallback necessaire
 # ---------------------------------------------------------------------------
+# EasyOCR n'est PAS charge au demarrage. Si le VLM (Niveau 1) traite toutes
+# les factures, on n'initialise jamais EasyOCR. Gain : ~500 Mo RAM + temps
+# de telechargement des modeles au premier run.
 
 import logging
 logging.getLogger("easyocr").setLevel(logging.ERROR)
 
-import easyocr
+_ocr_reader = None
 
-print("Initialisation d'EasyOCR...")
-reader = easyocr.Reader(["en", "fr"], gpu=False)
-print("[OK] EasyOCR initialise.")
+
+def _get_ocr_reader():
+    """Initialise EasyOCR au premier appel uniquement."""
+    global _ocr_reader
+    if _ocr_reader is None:
+        import easyocr
+        print("Initialisation d'EasyOCR (necessaire pour le fallback)...")
+        _ocr_reader = easyocr.Reader(["en", "fr"], gpu=False)
+        print("[OK] EasyOCR initialise.")
+    return _ocr_reader
 
 
 def extract_text_ocr(image: np.ndarray, confidence_threshold: float = 0.3) -> dict:
-    """Extrait le texte + confiance via EasyOCR."""
+    """Extrait le texte + confiance via EasyOCR (lazy-loaded)."""
+    reader = _get_ocr_reader()
     results = reader.readtext(image)
     blocks, texts, confidences = [], [], []
     for (bbox, text, confidence) in results:
